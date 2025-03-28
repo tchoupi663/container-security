@@ -1,0 +1,62 @@
+stages:
+  - lint
+  - build
+  - verify
+  - scan
+
+  # Étape 1 : Scan du Dockerfile avec Hadolint
+hadolint-scan:
+  stage: lint
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint --failure-threshold warning Dockerfile
+
+  # Étape 2 : Build de l'image et cosign l'image
+build-image:
+  stage: build
+  variables:
+    COSIGN_YES: "true"  # Used by Cosign to skip confirmation prompts for non-destructive operations
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  id_tokens:
+    SIGSTORE_ID_TOKEN:  # Used by Cosign to get certificate from Fulcio
+      aud: sigstore
+  image: docker:cli
+  services:
+    - docker:dind
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+    - docker build -t $DOCKER_IMAGE_NAME .
+    - docker push $DOCKER_IMAGE_NAME
+  after_script:
+    - apk add --update cosign
+    - IMAGE_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$DOCKER_IMAGE_NAME")"
+    - cosign sign "$IMAGE_DIGEST"
+
+  # Étape 3 : Verify image Cosign
+verify_image:
+  image: alpine:3.20
+  stage: verify
+  before_script:
+    - apk add --update cosign docker
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - cosign verify "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" --certificate-identity "https://gitlab.com/container-security2/session4//.gitlab-ci.yml@refs/heads/main" --certificate-oidc-issuer "https://gitlab.com"
+
+  # Étape 4 : Scan de sécurité avec Trivy
+trivy-scan:
+  stage: scan
+  variables:
+    # No need to clone the repo, we exclusively work on artifacts.  See
+    # https://docs.gitlab.com/ee/ci/runners/README.html#git-strategy
+    GIT_STRATEGY: none
+    TRIVY_USERNAME: "$CI_REGISTRY_USER"
+    TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+    TRIVY_AUTH_URL: "$CI_REGISTRY"
+    FULL_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: ["build-image"]
+  script:
+    - trivy --version
+    - trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
